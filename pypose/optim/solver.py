@@ -63,9 +63,9 @@ class PINV(nn.Module):
         Return:
             Tensor: the solved batched tensor.
         '''
-        return pinv(A, atol=self.atol, rtol=self.rtol, hermitian=self.hermitian) @ b
-
-
+        A_pinv = pinv(A, atol=self.atol, rtol=self.rtol, hermitian=self.hermitian)
+        return torch.einsum('bij, bj -> bi', A_pinv, b)
+        
 
 class LSTSQ(nn.Module):
     r'''The batched linear solver with fast pseudo inversion.

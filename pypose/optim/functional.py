@@ -2,7 +2,8 @@ import torch
 from .. import hasnan
 from functools import partial
 from torch.autograd.functional import jacobian
-from torch.func import jacrev, jacfwd, functional_call
+from torch.func import jacrev, jacfwd, functional_call, vmap
+import pypose as pp
 
 
 def modjac(model, input=None, create_graph=False, strict=False, vectorize=False, \
@@ -150,6 +151,36 @@ def modjac(model, input=None, create_graph=False, strict=False, vectorize=False,
                            for j, p in zip(J, params_values)], dim=1)
 
     return J
+
+
+def modjac_per_example(
+    model, 
+    input,
+):
+    params, buffers = dict(model.named_parameters()), dict(model.named_buffers())
+    params_names, params_values = params.keys(), tuple(params.values())
+    buffers_names, buffers_values = buffers.keys(), tuple(buffers.values())
+
+    def single_example_jacobian(param_values, buffer_values, input_i, target_i):
+        """ 
+            Takes one slice of parameters and inputs
+            NOTE: torch.autograd.functional.jacobian does not work inside vmap
+            -> taking pypose's jacrev
+        """
+        def func_param(param_values, buffer_values):
+            new_params_dict = dict(zip(params_names, param_values.unsqueeze(0)))
+            new_buffers_dict = dict(zip(buffers_names, buffer_values.unsqueeze(0)))
+            return functional_call(model, (new_params_dict, new_buffers_dict), (input_i, target_i))
+        jac_func = pp.func.jacrev(func_param, argnums=0)
+        return jac_func(param_values, buffer_values)
+    
+    # test = single_example_jacobian(params_values[0][0], buffers_values[0][0], input[0][0], input[1][0])
+        
+    # vmap over all examples - pp.retain_ltype() needed to retain pypose's LieTensor operations over torch vmap
+    with pp.retain_ltype():
+            batched_single_example_jacobian = vmap(single_example_jacobian)
+            jac_per_example = batched_single_example_jacobian(params_values[0], buffers_values[0], input[0], input[1])
+    return jac_per_example
 
 
 def modjacrev(model, input, argnums=0, *, has_aux=False):

@@ -1,7 +1,7 @@
 import torch
 from .. import bmv
 from torch import nn, finfo
-from .functional import modjac
+from .functional import modjac, modjac_per_example
 from .strategy import TrustRegion
 from torch.optim import Optimizer
 from .solver import PINV, Cholesky
@@ -51,9 +51,10 @@ class RobustModel(nn.Module):
                 ws = [wsi.squeeze(0) for wsi in ws]
                 weight_diag += ws * int(ni)
             weight_diag = torch.block_diag(*weight_diag)
-        R = [r.reshape(-1) for r in R]
+        # R = [r.reshape(-1) for r in R]
         J = torch.cat(J) if isinstance(J, (tuple, list)) else J
-        return torch.cat(R), weight_diag, J
+        R = torch.cat(R) if isinstance(R, (tuple, list)) else R
+        return R, weight_diag, J
 
     def forward(self, input, target):
         output = self.model_forward(input)
@@ -82,6 +83,7 @@ class RobustModel(nn.Module):
         if len(self.kernel) > 1:
             residuals = [k(r.square().sum(-1)).sum() for k, r in zip(self.kernel, residuals)]
         else:
+            # TODO: consider loss terms independently over batch dimension
             residuals = [self.kernel[0](r.square().sum(-1)).sum() for r in residuals]
         return sum(residuals)
 
@@ -97,8 +99,11 @@ class _Optimizer(Optimizer):
         r'''
         params will be updated by calling this function
         '''
-        steps = step.split([p.numel() for p in params if p.requires_grad])
-        [p.add_(d.view(p.shape)) for p, d in zip(params, steps) if p.requires_grad]
+        # no split required as step is computed over batch dimension
+        # steps = step.split([p.numel() for p in params if p.requires_grad])
+        #[p.add_(d.view(p.shape)) for p, d in zip(params, steps) if p.requires_grad]
+        steps = (step,)
+        [p.add_(d) for p, d in zip(params, steps) if p.requires_grad]
 
 
 class GaussNewton(_Optimizer):
@@ -272,7 +277,7 @@ class GaussNewton(_Optimizer):
         for pg in self.param_groups:
             weight = self.weight if weight is None else weight
             R = list(self.model(input, target))
-            J = modjac(self.model, input=(input, target), flatten=False, **self.jackwargs)
+            J = modjac_per_example(self.model, input=(input, target))
             params = dict(self.model.named_parameters())
             params_values = tuple(params.values())
             J = [self.model.flatten_row_jacobian(Jr, params_values) for Jr in J]
@@ -281,7 +286,7 @@ class GaussNewton(_Optimizer):
                     else self.corrector[i](R = R[i], J = J[i])
             R, weight, J = self.model.normalize_RWJ(R, weight, J)
             A, b = (J, -R) if weight is None else (weight @ J, -weight @ R)
-            D = self.solver(A = A, b = b.view(-1, 1))
+            D = self.solver(A = A, b = b)
             self.last = self.loss if hasattr(self, 'loss') \
                         else self.model.loss(input, target)
             self.update_parameter(params = pg['params'], step = D)
@@ -492,7 +497,7 @@ class LevenbergMarquardt(_Optimizer):
         for pg in self.param_groups:
             weight = self.weight if weight is None else weight
             R = list(self.model(input, target))
-            J = modjac(self.model, input=(input, target), flatten=False, **self.jackwargs)
+            J = modjac_per_example(self.model, input=(input, target))
             params = dict(self.model.named_parameters())
             params_values = tuple(params.values())
             J = [self.model.flatten_row_jacobian(Jr, params_values) for Jr in J]
@@ -503,19 +508,20 @@ class LevenbergMarquardt(_Optimizer):
 
             self.last = self.loss = self.loss if hasattr(self, 'loss') \
                                     else self.model.loss(input, target)
-            J_T = J.T @ weight if weight is not None else J.T
+            J_T = J.transpose(-2,-1) @ weight if weight is not None else J.transpose(-2,-1)
             A, self.reject_count = J_T @ J, 0
             A.diagonal().clamp_(pg['min'], pg['max'])
             while self.last <= self.loss:
                 A.diagonal().add_(A.diagonal() * pg['damping'])
                 try:
-                    D = self.solver(A = A, b = -J_T @ R.view(-1, 1))
+                    b = torch.einsum('bij, bj -> bi', -J_T, R)
+                    D = self.solver(A = A, b = b)
                 except Exception as e:
                     print(e, "\nLinear solver failed. Breaking optimization step...")
                     break
                 self.update_parameter(pg['params'], D)
                 self.loss = self.model.loss(input, target)
-                self.strategy.update(pg, last=self.last, loss=self.loss, J=J, D=D, R=R.view(-1, 1))
+                self.strategy.update(pg, last=self.last, loss=self.loss, J=J, D=D.unsqueeze(-1), R=R.unsqueeze(-1))
                 if self.last < self.loss and self.reject_count < self.reject: # reject step
                     self.update_parameter(params = pg['params'], step = -D)
                     self.loss, self.reject_count = self.last, self.reject_count + 1
