@@ -168,8 +168,14 @@ def modjac_per_example(
             -> taking pypose's jacrev
         """
         def func_param(param_values, buffer_values):
-            new_params_dict = dict(zip(params_names, param_values.unsqueeze(0)))
-            new_buffers_dict = dict(zip(buffers_names, buffer_values.unsqueeze(0)))
+            if isinstance(param_values, tuple): 
+                new_params_dict = dict(zip(params_names, param_values))
+            elif torch.is_tensor(param_values):
+                new_params_dict = dict(zip(params_names, param_values.unsqueeze(0)))
+            if isinstance(buffer_values, tuple): 
+                 new_buffers_dict = dict(zip(buffers_names, buffer_values))
+            elif torch.is_tensor(buffer_values):
+                new_buffers_dict = dict(zip(buffers_names, buffer_values.unsqueeze(0)))
             return functional_call(model, (new_params_dict, new_buffers_dict), (input_i, target_i))
         jac_func = pp.func.jacrev(func_param, argnums=0)
         return jac_func(param_values, buffer_values)
@@ -179,7 +185,7 @@ def modjac_per_example(
     # vmap over all examples - pp.retain_ltype() needed to retain pypose's LieTensor operations over torch vmap
     with pp.retain_ltype():
             batched_single_example_jacobian = vmap(single_example_jacobian)
-            jac_per_example = batched_single_example_jacobian(params_values[0], buffers_values[0], input[0], input[1])
+            jac_per_example = batched_single_example_jacobian(params_values, buffers_values, input[0], input[1])
     return jac_per_example
 
 

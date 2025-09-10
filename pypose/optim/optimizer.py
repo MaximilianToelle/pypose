@@ -35,6 +35,7 @@ class RobustModel(nn.Module):
 
     def flatten_row_jacobian(self, J, params_values):
         if isinstance(J, (tuple, list)):
+            # change for proper use with batch size
             J = torch.cat([j.reshape(-1, p.numel()) for j, p in zip(J, params_values)], 1)
         return J
 
@@ -274,18 +275,21 @@ class GaussNewton(_Optimizer):
             Pose Inversion error: 0.0000005 @ 3 it
             Early Stopping with error: 5.21540641784668e-07
         '''
-        for pg in self.param_groups:
+        for idx, pg in enumerate(self.param_groups):
             weight = self.weight if weight is None else weight
             R = list(self.model(input, target))
             J = modjac_per_example(self.model, input=(input, target))
-            params = dict(self.model.named_parameters())
-            params_values = tuple(params.values())
-            J = [self.model.flatten_row_jacobian(Jr, params_values) for Jr in J]
+            J = J[0][idx]
             for i in range(len(R)):
                 R[i], J[i] = self.corrector[0](R = R[i], J = J[i]) if len(self.corrector) ==1 \
                     else self.corrector[i](R = R[i], J = J[i])
-            R, weight, J = self.model.normalize_RWJ(R, weight, J)
-            A, b = (J, -R) if weight is None else (weight @ J, -weight @ R)
+            J = torch.cat(J) if isinstance(J, (tuple, list)) else J
+            R = torch.cat(R) if isinstance(R, (tuple, list)) else R
+            if weight is None: 
+                A, b = (J, -R)
+            else:
+                A = torch.einsum('ij,bjk->bik', weight, J)
+                b = -torch.einsum('ij,bj->bi', weight, R)
             D = self.solver(A = A, b = b)
             self.last = self.loss if hasattr(self, 'loss') \
                         else self.model.loss(input, target)

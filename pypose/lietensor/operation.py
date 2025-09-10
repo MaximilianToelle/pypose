@@ -24,12 +24,21 @@ def so3_Jl_inv(x):
     K = vec2skew(x)
     theta = torch.linalg.norm(x, dim=-1, keepdim=True).unsqueeze(-1)
     I = torch.eye(3, device=x.device, dtype=x.dtype).expand(x.shape[:-1]+(3, 3))
-    idx = (theta > torch.finfo(theta.dtype).eps)
-    coef2 = torch.zeros_like(theta, requires_grad=False)
-    theta_idx = theta[idx]
-    theta_half_idx, theta2_idx = 0.5 * theta_idx, theta_idx * theta_idx
-    coef2[idx] = (1.0 - theta_idx * theta_half_idx.cos() / (2.0 * theta_half_idx.sin())) / theta2_idx
-    coef2[~idx] = 1.0 / 12.0
+    # idx = (theta > torch.finfo(theta.dtype).eps)
+    # coef2 = torch.zeros_like(theta, requires_grad=False)
+    # theta_idx = theta[idx]
+    # theta_half_idx, theta2_idx = 0.5 * theta_idx, theta_idx * theta_idx
+    # coef2[idx] = (1.0 - theta_idx * theta_half_idx.cos() / (2.0 * theta_half_idx.sin())) / theta2_idx
+    # coef2[~idx] = 1.0 / 12.0
+
+    #vmap version 
+    eps = torch.finfo(theta.dtype).eps
+    theta_half = 0.5 * theta
+    theta2 = theta * theta
+
+    coef2_val = (1.0 - (theta * theta_half).cos() / (2.0 * theta_half.sin())) / theta2
+    coef2 = torch.where(theta > eps, coef2_val, torch.full_like(theta, 1.0/12.0))
+
     return (I - 0.5 * K + coef2 * (K @ K))
 
 def so3_adj(x):
@@ -314,12 +323,22 @@ class SO3_Log(torch.autograd.Function):
         w_larger_than_eps = (w_abs > eps)
         idx1 = v_larger_than_eps & w_larger_than_eps
         idx2 = v_larger_than_eps & (~w_larger_than_eps)
-        idx3 = (~v_larger_than_eps)
+        # idx3 = (~v_larger_than_eps)
 
-        factor = torch.zeros_like(v_norm, requires_grad=False)
-        factor[idx1] = 2.0 * torch.atan(v_norm[idx1]/w[idx1]) / v_norm[idx1]
-        factor[idx2] = pm(w[idx2]) * torch.pi / v_norm[idx2]
-        factor[idx3] = 2.0 * (1.0 / w[idx3] - v_norm[idx3] * v_norm[idx3] / (3 * w[idx3]**3))
+        # factor = torch.zeros_like(v_norm, requires_grad=False)
+        # factor[idx1] = 2.0 * torch.atan(v_norm[idx1]/w[idx1]) / v_norm[idx1]
+        # factor[idx2] = pm(w[idx2]) * torch.pi / v_norm[idx2]
+        # factor[idx3] = 2.0 * (1.0 / w[idx3] - v_norm[idx3] * v_norm[idx3] / (3 * w[idx3]**3))
+        
+        # vmap version
+        factor1 = 2.0 * torch.atan(v_norm / w) / v_norm
+        factor2 = pm(w) * torch.pi / v_norm
+        factor3 = 2.0 * (1.0 / w - v_norm * v_norm / (3 * w**3))
+
+        factor = torch.where(idx1, factor1,
+                 torch.where(idx2, factor2,
+                 factor3))
+        
         output = factor * v
         return output
 
