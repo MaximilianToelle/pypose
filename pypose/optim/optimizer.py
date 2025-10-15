@@ -7,6 +7,7 @@ from torch.optim import Optimizer
 from .solver import PINV, Cholesky
 from torch.linalg import cholesky_ex
 from .corrector import FastTriggs
+import time
 
 
 class Trivial(torch.nn.Module):
@@ -81,6 +82,20 @@ class RobustModel(nn.Module):
     def loss(self, input, target):
         output = self.model_forward(input)
         residuals = self.residuals(output, target)
+        if len(self.kernel) > 1:
+            residuals = [k(r.square().sum(-1)).sum() for k, r in zip(self.kernel, residuals)]
+        else:
+            # TODO: consider loss terms independently over batch dimension
+            residuals = [self.kernel[0](r.square().sum(-1)).sum() for r in residuals]
+        return sum(residuals)
+    
+    def weighted_loss(self, input, target, weight):
+        """ weights residuals as done before during optimization """
+        output = self.model_forward(input)
+        residuals = list(self.residuals(output, target))
+        for i in range(len(residuals)):
+            residuals[i] = torch.einsum('bij,bj->bi', weight, residuals[i])
+
         if len(self.kernel) > 1:
             residuals = [k(r.square().sum(-1)).sum() for k, r in zip(self.kernel, residuals)]
         else:
@@ -288,13 +303,15 @@ class GaussNewton(_Optimizer):
             if weight is None: 
                 A, b = (J, -R)
             else:
-                A = torch.einsum('ij,bjk->bik', weight, J)
-                b = -torch.einsum('ij,bj->bi', weight, R)
-            D = self.solver(A = A, b = b)
+                A = torch.einsum('bij,bjk->bik', weight, J)
+                b = -torch.einsum('bij,bj->bi', weight, R)
+            D = self.solver.grouped_forward(A = A, b = b, threshold_num_equations=A.shape[1])   # full correspondence requirement
+            # D = self.solver(A = A, b = b)
             self.last = self.loss if hasattr(self, 'loss') \
-                        else self.model.loss(input, target)
+                        else self.model.weighted_loss(input, target, weight)
             self.update_parameter(params = pg['params'], step = D)
-            self.loss = self.model.loss(input, target)
+            # self.loss = self.model.loss(input, target)
+            self.loss = self.model.weighted_loss(input, target, weight)
         return self.loss
 
 
@@ -498,18 +515,20 @@ class LevenbergMarquardt(_Optimizer):
             `examples/module/pgo
             <https://github.com/pypose/pypose/tree/main/examples/module/pgo>`_.
         '''
-        for pg in self.param_groups:
+        for idx, pg in enumerate(self.param_groups):
             weight = self.weight if weight is None else weight
             R = list(self.model(input, target))
             J = modjac_per_example(self.model, input=(input, target))
-            params = dict(self.model.named_parameters())
-            params_values = tuple(params.values())
-            J = [self.model.flatten_row_jacobian(Jr, params_values) for Jr in J]
+            J = J[0][idx]
+            #params = dict(self.model.named_parameters())
+            #params_values = tuple(params.values())
+            #J = [self.model.flatten_row_jacobian(Jr, params_values) for Jr in J]
             for i in range(len(R)):
                 R[i], J[i] = self.corrector[0](R = R[i], J = J[i]) if len(self.corrector) ==1 \
                     else self.corrector[i](R = R[i], J = J[i])
-            R, weight, J = self.model.normalize_RWJ(R, weight, J)
-
+            J = torch.cat(J) if isinstance(J, (tuple, list)) else J
+            R = torch.cat(R) if isinstance(R, (tuple, list)) else R
+            # R, weight, J = self.model.normalize_RWJ(R, weight, J)
             self.last = self.loss = self.loss if hasattr(self, 'loss') \
                                     else self.model.loss(input, target)
             J_T = J.transpose(-2,-1) @ weight if weight is not None else J.transpose(-2,-1)

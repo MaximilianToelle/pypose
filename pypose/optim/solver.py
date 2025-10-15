@@ -4,6 +4,7 @@ from typing import Optional
 from torch import Tensor, nn
 from ..function.linalg import bmv
 from torch.linalg import pinv, lstsq, cholesky_ex, vecdot
+from collections import defaultdict
 
 
 class PINV(nn.Module):
@@ -65,7 +66,57 @@ class PINV(nn.Module):
         '''
         A_pinv = pinv(A, atol=self.atol, rtol=self.rtol, hermitian=self.hermitian)
         return torch.einsum('bij, bj -> bi', A_pinv, b)
-        
+    
+    def grouped_forward(self, A: Tensor, b: Tensor, threshold_num_equations: int) -> Tensor: 
+        '''
+        Idea: torch.linalg.pinv is fast for batched input - make subbachtes of same shape (same number of visible points)
+        Eliminates zero rows of A and b, solves the grouped optimization problem and adds individual results to an original-sized output tensor.
+        Use when A and b are sparse tensors with many (but identical) zero rows.
+
+        Args:
+            A (Tensor): the input batched tensor.
+            b (Tensor): the batched tensor on the right hand side.
+            threshold_num_equations (int): Groups need at least threshold_num_equations (number of parameter - zero rows) to still be feasible for optimization. Groups with a lower number do not get optimized. 
+        Return:
+            Tensor: the solved batched tensor with zero values for groups with infeasible optimization based on threshold_num_zero_rows
+        '''
+        G, C, P = A.shape       # num_gaussian, num_correspondences, num_parameters
+
+        x_out = torch.zeros((G, P), device=A.device, dtype=A.dtype)
+
+        visibility_mask = (A.abs().sum(dim=2) != 0.0)
+        num_visible_points_per_Gaussian = visibility_mask.sum(dim=1)
+
+        # iterate over unique visible counts (usually <= C)
+        unique_num_visible_points = torch.unique(num_visible_points_per_Gaussian)
+
+        if unique_num_visible_points.numel() == 1:
+            if unique_num_visible_points == C:
+                # no zero rows - do original forward
+                A_pinv = pinv(A, atol=self.atol, rtol=self.rtol, hermitian=self.hermitian)
+                return torch.einsum('bij, bj -> bi', A_pinv, b)
+
+        for num_visible_points in unique_num_visible_points:
+            # skip groups with zero visible points (can't solve) or those having less visible points than parameter to solve for
+            if num_visible_points == 0:
+                continue
+            if num_visible_points < int(threshold_num_equations):
+                continue
+
+            idxs = (num_visible_points_per_Gaussian == num_visible_points).nonzero(as_tuple=True)[0]
+            B = idxs.numel()    # subbatch size
+
+            # create subbatch based on Gaussians with the same number of visible points (count) and eliminate zero rows based on visibility mask
+            visibility_mask_per_selected_Gaussian = visibility_mask[idxs]  
+            A_subbatch = A[idxs][visibility_mask_per_selected_Gaussian].view(B, num_visible_points, P)
+            b_subbatch = b[idxs][visibility_mask_per_selected_Gaussian].view(B, num_visible_points)
+
+            pinv_A_subbatch = torch.linalg.pinv(A_subbatch, atol=self.atol, rtol=self.rtol, hermitian=self.hermitian)
+            x_subbatch = torch.einsum('bij, bj -> bi', pinv_A_subbatch, b_subbatch)
+
+            x_out[idxs] = x_subbatch
+        return x_out
+    
 
 class LSTSQ(nn.Module):
     r'''The batched linear solver with fast pseudo inversion.
